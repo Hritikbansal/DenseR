@@ -176,7 +176,7 @@ if __name__ == "__main__":
         peft_config=get_peft_config(model_args),
     )
     trainer.tools = None
-    trainer.vllm_generation.tools = None
+    # trainer.vllm_generation.tools = None
     
     trainer.train()
 
