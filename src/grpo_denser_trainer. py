@@ -1,0 +1,410 @@
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+GRPODENSERTrainer -- GRPO with Divergence-Enhanced Nuanced Supervision for Effective Reasoning.
+
+Inherits from GRPOTrainer and overrides two methods:
+
+  1. ``_generate_and_score_completions`` -- enables a persistent forward hook
+     that captures hidden states during the parent's own forward pass for
+     ``old_per_token_logps`` (zero extra compute), then computes DENSER
+     per-token weights and stores them in the output dict.
+
+  2. ``_compute_loss`` -- reads the pre-computed ``denser_weights`` from the
+     inputs, multiplies with the scalar advantages to produce (B, T) token-level
+     advantages, then delegates to the parent loss.  No extra forward pass.
+
+Why a hook instead of ``output_hidden_states=True``?
+
+  With DeepSpeed ZeRO-3 / FSDP / torch.compile the model's forward trace is
+  cached.  Passing ``output_hidden_states=True`` changes the output structure
+  and invalidates that cache ("Invalidate trace cache @ step 0 and module 0").
+  A ``register_forward_hook`` on a single decoder layer captures exactly the
+  tensor we need without altering the forward signature or outputs at all.
+
+Why compute weights in ``_generate_and_score_completions``?
+
+  At that point samples are still grouped by prompt (consecutive
+  ``num_generations`` samples share a prompt).  The parent's ``_prepare_inputs``
+  later calls ``shuffle_sequence_dict`` which destroys this grouping.  The
+  DENSER weights tensor gets shuffled/split in lockstep with everything else.
+"""
+
+from collections.abc import Callable
+from typing import Any
+
+import torch
+from datasets import Dataset, IterableDataset
+from transformers import (
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+    ProcessorMixin,
+    TrainerCallback,
+)
+
+from denser import compute_denser_weights
+from trl.trainer.grpo_trainer import RewardFunc, RolloutFunc
+
+from trl import (
+    GRPOConfig,
+    GRPOTrainer,
+)
+from trl.models.utils import disable_gradient_checkpointing
+from accelerate.utils import gather, gather_object, is_peft_model, set_seed
+
+try:
+    from peft import PeftConfig, PeftModel
+except ImportError:
+    PeftConfig = PeftModel = None
+
+
+class GRPODENSERTrainer(GRPOTrainer):
+    """
+    GRPO trainer extended with Divergence-Enhanced Nuanced Supervision for Effective Reasoning.
+
+    For each rollout at each token position, computes a weight based on:
+
+      1. **Cross-class divergence** -- how different is this token's hidden state
+         from the opposite advantage class (positive vs negative)?
+      2. **Within-class uniqueness** -- how different is it from same-class peers
+         (to preserve diverse solution strategies)?
+
+    These weights modulate the per-token advantage before the PPO-style clipped
+    loss, focusing gradient on the tokens that actually *caused* success or
+    failure and upweighting rare but valid strategies.
+
+    The parent ``_compute_loss`` already supports ``(B, T)`` advantages
+    (documented via the MiniLLM comment in the source).  This trainer converts
+    the scalar ``(B,)`` advantages to ``(B, T)`` by element-wise multiplication
+    with the DENSER weights.
+    """
+
+    _name = "GRPO-DENSER"
+
+    def __init__(
+        self,
+        model: "str | PreTrainedModel | PeftModel",
+        reward_funcs: RewardFunc | list[RewardFunc],
+        args: GRPOConfig | None = None,
+        train_dataset: Dataset | IterableDataset | None = None,
+        eval_dataset: Dataset | IterableDataset | dict[str, Dataset | IterableDataset] | None = None,
+        processing_class: PreTrainedTokenizerBase | ProcessorMixin | None = None,
+        reward_processing_classes: PreTrainedTokenizerBase | list[PreTrainedTokenizerBase] | None = None,
+        callbacks: list[TrainerCallback] | None = None,
+        optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
+        peft_config: "PeftConfig | None" = None,
+        tools: list[Callable] | None = None,
+        rollout_func: RolloutFunc | None = None,
+    ):
+        # Read DENSER config before super().__init__
+        self.use_denser = getattr(args, "use_denser", False)
+        self.denser_alpha_cross = getattr(args, "denser_alpha_cross", 1.0)
+        self.denser_alpha_within = getattr(args, "denser_alpha_within", 1.0)
+        self.denser_beta = getattr(args, "denser_beta", 1.0)
+        self.denser_window_size = getattr(args, "denser_window_size", 5)
+
+        super().__init__(
+            model=model,
+            reward_funcs=reward_funcs,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            reward_processing_classes=reward_processing_classes,
+            callbacks=callbacks,
+            optimizers=optimizers,
+            peft_config=peft_config,
+            tools=tools,
+            rollout_func=rollout_func,
+        )
+
+        if self.use_denser and self.use_liger_kernel:
+            raise ValueError(
+                "DENSER is not compatible with the Liger kernel loss path. Disable one of them."
+            )
+
+        # Resolve the target decoder layer and register a persistent hook.
+        # Registering once avoids DeepSpeed trace-cache invalidation that
+        # occurs when hooks are added/removed between forward passes.
+        if self.use_denser:
+            self._denser_target_layer = self._resolve_decoder_layer()
+            self._denser_hs_chunks: list[torch.Tensor] = []
+            self._denser_capture_enabled = False
+
+            def _denser_hook(module, args, output):
+                if self._denser_capture_enabled:
+                    hs = output[0] if isinstance(output, tuple) else output
+                    self._denser_hs_chunks.append(hs.detach())
+
+            self._denser_target_layer.register_forward_hook(_denser_hook)
+
+    # ------------------------------------------------------------------
+    # Layer resolution
+    # ------------------------------------------------------------------
+    def _resolve_decoder_layer(self) -> torch.nn.Module:
+        """
+        Find the **last** decoder layer in the model.
+
+        Always returns the final layer, which carries the richest semantic
+        representation for DENSER divergence computation.
+
+        Works for the common HuggingFace causal-LM patterns:
+          - ``model.model.layers``  (LLaMA, Qwen, Mistral, Gemma, SmolVLM, ...)
+          - ``model.transformer.h`` (GPT-2, GPT-Neo)
+          - ``model.gpt_neox.layers`` (GPT-NeoX, Pythia)
+        """
+        base = self.accelerator.unwrap_model(self.model)
+        if is_peft_model(base):
+            base = base.get_base_model()
+
+        # Walk common attribute paths
+        for path in ("model.layers", "transformer.h", "gpt_neox.layers",
+                      "model.decoder.layers"):
+            obj = base
+            try:
+                for attr in path.split("."):
+                    obj = getattr(obj, attr)
+                return obj[-1]  # always last layer
+            except (AttributeError, IndexError, TypeError):
+                continue
+
+        raise ValueError(
+            f"Could not locate decoder layers on {type(base).__name__}. "
+            "DENSER needs access to the last decoder layer for hidden-state extraction."
+        )
+
+    # ------------------------------------------------------------------
+    # Override: compute DENSER weights while samples are still grouped
+    # ------------------------------------------------------------------
+    def _generate_and_score_completions(
+        self, inputs: list[dict[str, torch.Tensor | Any]]
+    ) -> dict[str, torch.Tensor | Any]:
+        """
+        Extends the parent to compute DENSER weights right after rewards /
+        advantages are ready -- at this point consecutive ``num_generations``
+        samples still belong to the same prompt, which is required for the
+        cross-class / within-class divergence computation.
+
+        Hidden states are captured for free during the parent's existing
+        forward pass for ``old_per_token_logps`` via a persistent hook --
+        no extra forward pass is needed.
+
+        The weights are stored in ``output["denser_weights"]`` (shape ``(B, T)``)
+        and travel through shuffle / split together with the other tensors so
+        they remain aligned after ``shuffle_sequence_dict`` and
+        ``split_tensor_dict``.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        mode = "train" if self.model.training else "eval"
+        num_gen = (
+            self.num_generations if mode == "train" else self.num_generations_eval
+        )
+
+        # Enable hidden-state capture BEFORE calling parent so the hook
+        # fires during the parent's own forward pass for old_per_token_logps.
+        if self.use_denser and num_gen >= 2:
+            self._denser_hs_chunks.clear()
+            self._denser_capture_enabled = True
+
+        # Delegate ALL generation, reward, and advantage logic to the parent.
+        # With vLLM, generation runs on a separate engine (hook doesn't fire).
+        # The parent's forward pass for old_per_token_logps fires the hook.
+        output = super()._generate_and_score_completions(inputs)
+
+        if self.use_denser:
+            self._denser_capture_enabled = False
+
+        if not self.use_denser or num_gen < 2:
+            return output
+
+        # ---- Extract hidden states captured during parent's forward ----
+        # The parent processes the batch in chunks; each chunk fires the hook.
+        # Filter by expected sequence length to exclude any captures from
+        # model.generate() (autoregressive, varying lengths) when not using
+        # vLLM.
+        expected_seq_len = output["prompt_ids"].size(1) + output["completion_ids"].size(1)
+        logits_to_keep = output["completion_ids"].size(1)
+
+        valid_chunks = [
+            hs for hs in self._denser_hs_chunks
+            if hs.size(1) == expected_seq_len
+        ]
+
+        if not valid_chunks:
+            # Fallback: no captures matched (shouldn't happen in normal flow)
+            logger.warning(
+                "[DENSER] No hidden states captured during parent's forward pass. "
+                "Falling back to uniform weights."
+            )
+            output["denser_weights"] = torch.ones_like(output["completion_mask"])
+            return output
+
+        # (B, full_seq_len, D) → (B, completion_len, D)
+        full_hs = torch.cat(valid_chunks, dim=0)
+        hidden_states = full_hs[:, :-1, :]              # drop next-token-pred position
+        hidden_states = hidden_states[:, -logits_to_keep:, :]  # completion only
+
+        # Free memory
+        self._denser_hs_chunks.clear()
+
+        # ---- Compute DENSER weights locally (no cross-GPU communication) ----
+        # We require that each GPU has complete prompt groups locally, i.e.
+        # local_batch_size % num_generations == 0.  This avoids expensive
+        # all-gather of the (B, T, D) hidden states tensor.
+        advantages = output["advantages"]           # (B_local,)
+        completion_mask = output["completion_mask"]  # (B_local, T)
+        mask = (
+            completion_mask if "tool_mask" not in output
+            else completion_mask * output["tool_mask"]
+        )
+        local_batch_size = hidden_states.size(0)
+
+        if local_batch_size % num_gen != 0:
+            raise ValueError(
+                f"DENSER requires each GPU to have complete prompt groups, but got "
+                f"local_batch_size={local_batch_size} with num_generations={num_gen} "
+                f"(remainder {local_batch_size % num_gen}). "
+                f"Set per_device_train_batch_size to a multiple of num_generations "
+                f"(e.g. per_device_train_batch_size={num_gen}) so that "
+                f"num_generations completions per prompt stay on the same GPU."
+            )
+        num_groups = local_batch_size // num_gen
+
+        denser_weights, cross_div, within_uniq = compute_denser_weights(
+            hidden_states=hidden_states,
+            advantages=advantages,
+            completion_mask=mask,
+            num_generations=num_gen,
+            window_size=self.denser_window_size,
+            alpha_cross=self.denser_alpha_cross,
+            alpha_within=self.denser_alpha_within,
+            beta=self.denser_beta,
+        )
+
+        # Count groups with cross-class signal
+        has_contrast = 0
+        for g in range(num_groups):
+            g_adv = advantages[g * num_gen:(g + 1) * num_gen]
+            if (g_adv > 0).any().item() and (g_adv < 0).any().item():
+                has_contrast += 1
+
+        if self.accelerator.is_main_process:
+            logger.info(
+                f"[DENSER] {mode}: B_local={local_batch_size}, "
+                f"num_gen={num_gen}, num_groups={num_groups}, "
+                f"groups_with_contrast={has_contrast}/{num_groups}, "
+                f"adv_range=[{advantages.min().item():.4f}, {advantages.max().item():.4f}]"
+            )
+
+        # ---- Log weight statistics ----
+        valid = mask.bool()
+        if valid.sum() > 0:
+            flat_w = denser_weights[valid]
+            self._metrics[mode]["denser/weight_mean"].append(
+                self.accelerator.gather(flat_w.mean()).mean().item()
+            )
+            self._metrics[mode]["denser/weight_std"].append(
+                self.accelerator.gather(flat_w.std()).mean().item()
+            )
+            self._metrics[mode]["denser/groups_with_contrast"].append(
+                has_contrast / max(num_groups, 1)
+            )
+
+        # ---- Log per-completion diagnostics to wandb table ----
+        if (
+            self.accelerator.is_main_process
+            and self.args.log_completions
+            and self.state.global_step % self.args.logging_steps == 0
+        ):
+            try:
+                import wandb
+                if wandb.run is not None:
+                    table_data = []
+                    prompt_ids = output["prompt_ids"]        # (B_local, P)
+                    completion_ids = output["completion_ids"]  # (B_local, T)
+
+                    # Per-completion std of token weights (shows how much
+                    # DENSER differentiates tokens; 0 = uniform, higher = more focused)
+                    valid_counts = mask.sum(dim=1).clamp(min=1)
+                    w_mean_per_sample = (denser_weights * mask).sum(dim=1) / valid_counts  # always ~1
+                    w_var = ((denser_weights - w_mean_per_sample.unsqueeze(1)) ** 2 * mask).sum(dim=1) / valid_counts
+                    w_std = w_var.sqrt()
+
+                    # Token-level advantage: adv[i] * weight[i,t]
+                    # std shows the spread of per-token gradient signal
+                    token_adv = advantages.unsqueeze(1) * denser_weights  # (B, T)
+                    ta_mean = (token_adv * mask).sum(dim=1) / valid_counts
+                    ta_var = ((token_adv - ta_mean.unsqueeze(1)) ** 2 * mask).sum(dim=1) / valid_counts
+                    ta_std = ta_var.sqrt()
+
+                    # Log first group (num_gen rows) for readability
+                    n_log = min(num_gen, local_batch_size)
+                    for i in range(n_log):
+                        prompt_text = self.processing_class.decode(
+                            prompt_ids[i], skip_special_tokens=True
+                        )
+                        completion_text = self.processing_class.decode(
+                            completion_ids[i], skip_special_tokens=True
+                        )
+                        table_data.append([
+                            prompt_text[-200:],
+                            completion_text[-500:],
+                            round(advantages[i].item(), 4),
+                            round(ta_std[i].item(), 4),
+                            round(cross_div[i].item(), 4),
+                            round(within_uniq[i].item(), 4),
+                            round(w_std[i].item(), 4),
+                        ])
+
+                    table = wandb.Table(
+                        columns=[
+                            "prompt", "completion",
+                            "grpo_advantage", "token_adv_std",
+                            "denser_cross_div", "denser_within_uniq",
+                            "denser_weight_std",
+                        ],
+                        data=table_data,
+                    )
+                    wandb.log({"denser_completions": table})
+            except ImportError:
+                pass
+
+        # ---- Store in output dict -- shuffled/split with everything else ----
+        output["denser_weights"] = denser_weights
+
+        return output
+
+    # ------------------------------------------------------------------
+    # Override: apply pre-computed weights to advantages before loss
+    # ------------------------------------------------------------------
+    def _compute_loss(self, model, inputs):
+        if not self.use_denser or "denser_weights" not in inputs:
+            return super()._compute_loss(model, inputs)
+
+        # Pop so parent doesn't see an unexpected key
+        denser_weights = inputs.pop("denser_weights")  # (B, T)
+        advantages = inputs["advantages"]              # (B,) scalar per sample
+
+        # Expand to (B, T) token-level advantages weighted by DENSER.
+        # Parent checks ``if advantages.dim() == 1: advantages = advantages.unsqueeze(1)``
+        # By passing (B, T) we skip that branch; all downstream ops (clipping,
+        # every loss_type) broadcast correctly against (B, T).
+        weighted_advantages = advantages.unsqueeze(1) * denser_weights  # (B, T)
+
+        inputs = {**inputs, "advantages": weighted_advantages}
+
+        return super()._compute_loss(model, inputs)
