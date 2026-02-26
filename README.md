@@ -73,3 +73,14 @@ python -m eval.eval \
     --batch_size 8 \
     --output_path logs
 ```
+
+## Citation
+
+```
+@article{bansal2026denser,
+  title={DenseR: Dense Reward For Free in LLM Reasoning},
+  author={Bansal, Hritik},
+  year={2026},
+  url={https://huggingface.co/blog/hbXNov/denser}
+}
+```
