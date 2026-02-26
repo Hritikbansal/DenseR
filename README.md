@@ -3,6 +3,10 @@ Dense Reward For Free in LLM Reasoning
 
 This repo contains the code for the blog post: https://huggingface.co/blog/hbXNov/denser.
 
+## Updates
+
+25 Feb: The blog and code was updated to include a new section on [Probing DenseR's Assumptions and Open Questions](https://huggingface.co/blog/hbXNov/denser#update-probing-densers-assumptions-and-open-questions).
+
 ## Instructions
 
 The code is based on TRL repo: https://github.com/huggingface/trl
